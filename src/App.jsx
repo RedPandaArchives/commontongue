@@ -1,10 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { supabase } from "./supabaseClient.js";
 
-// Interpreter Booth — with real accounts.
-// Sign up / log in (Supabase Auth). Identity = authenticated user; display
-// name + reading language live in user metadata so they persist across sessions.
-
 const LANGS = [
   { code: "DE", name: "German" }, { code: "FR", name: "French" },
   { code: "EN", name: "English" }, { code: "ES", name: "Spanish" },
@@ -96,7 +92,7 @@ function Auth() {
     <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
       <div style={{ width: 340, maxWidth: "90vw" }}>
         <div style={mono.brand}>
-          <span style={{ color: ACCENT }}>INTERPRETER</span><span style={{ color: "#54697c" }}>·</span><span style={{ color: "#f0a860" }}>BOOTH</span>
+          <span style={{ color: ACCENT }}>COMMON</span><span style={{ color: "#f0a860" }}>TONGUE</span>
         </div>
         <p style={{ color: "#8ba0b4", fontSize: 13, margin: "8px 0 22px" }}>
           {mode === "signup" ? "Create an account to join the room." : "Log in to your account."}
@@ -238,7 +234,7 @@ function Room({ me }) {
     <div style={{ height: "100vh", display: "flex", flexDirection: "column" }}>
       <header style={hdr}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 12, minWidth: 0 }}>
-          <span style={mono.brand}><span style={{ color: ACCENT }}>INTERPRETER</span><span style={{ color: "#54697c" }}>·</span><span style={{ color: "#f0a860" }}>BOOTH</span></span>
+          <span style={mono.brand}><span style={{ color: ACCENT }}>COMMON</span><span style={{ color: "#54697c" }}>·</span><span style={{ color: "#f0a860" }}>TONGUE</span></span>
           <span style={{ color: "#54697c", fontSize: 12, whiteSpace: "nowrap" }}>{me.name} · reading {me.lang}</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
