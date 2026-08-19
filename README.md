@@ -1,4 +1,4 @@
-# Interpreter Booth — translation chat with accounts
+#CommonTongue — translation chat with accounts
 
 Sign up, join the room, write in your language and read everyone else's in it.
 Messages travel between separate browsers in real time; translation happens on
