@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { supabase } from "./supabaseClient.js";
+import { api, saveAuth, loadAuth, clearAuth } from "./api.js";
 
 const LANGS = [
   { code: "DE", name: "German" }, { code: "FR", name: "French" },
@@ -11,51 +11,23 @@ const LANGS = [
 ];
 const nameOf = (c) => (LANGS.find((l) => l.code === c) || {}).name || c;
 const ACCENT = "#4fd1c5";
-const ROOM = "lobby";
 
-async function translate(text, sourceCode, targetCode) {
-  if (sourceCode === targetCode) return text;
-  const res = await fetch("/api/translate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, sourceLang: sourceCode, targetLang: targetCode }),
-  });
-  if (!res.ok) throw new Error("translate failed");
-  const data = await res.json();
-  const out = (data.translation || "").trim();
-  if (!out) throw new Error("empty");
-  return out;
-}
-
-// Cache-aware translation. Content-keyed so the same (source, target, text)
-// is translated ONCE across every viewer and every repeat — not per person.
-//   1. session cache (instant, no network)   2. shared DB cache (one round-trip)
-//   3. miss -> pay for the API once, then write it back for everyone else.
+// Translate an incoming message to the reader's language via our backend.
+// The backend holds the shared cache, so each distinct (source, target, text)
+// is paid for once. A small session cache avoids repeat round-trips too.
 const memCache = new Map();
-const cacheKey = (text, s, t) => s + "|" + t + "|" + text;
-
 async function translateCached(text, sourceCode, targetCode) {
   if (sourceCode === targetCode) return text;
-  const key = cacheKey(text, sourceCode, targetCode);
-
+  const key = sourceCode + "|" + targetCode + "|" + text;
   if (memCache.has(key)) return memCache.get(key);
-
-  const { data: hit } = await supabase
-    .from("translations").select("text").eq("cache_key", key).maybeSingle();
-  if (hit && hit.text) {
-    memCache.set(key, hit.text);
-    return hit.text;
-  }
-
-  const out = await translate(text, sourceCode, targetCode);
+  const { translation } = await api.translate(text, sourceCode, targetCode);
+  const out = (translation || "").trim();
+  if (!out) throw new Error("empty");
   memCache.set(key, out);
-  // write-back for everyone else; ignore if another client won the race
-  await supabase.from("translations")
-    .upsert({ cache_key: key, text: out }, { onConflict: "cache_key", ignoreDuplicates: true });
   return out;
 }
 
-function Auth() {
+function Auth({ onAuthed }) {
   const [mode, setMode] = useState("signup");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -70,17 +42,11 @@ function Auth() {
     if (mode === "signup" && !name.trim()) return setMsg({ t: "err", m: "Pick a display name." });
     setBusy(true);
     try {
-      if (mode === "signup") {
-        const { data, error } = await supabase.auth.signUp({
-          email: email.trim(), password,
-          options: { data: { display_name: name.trim(), lang } },
-        });
-        if (error) throw error;
-        if (!data.session) setMsg({ t: "ok", m: "Account made. Check your email to confirm, then log in." });
-      } else {
-        const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
-        if (error) throw error;
-      }
+      const res = mode === "signup"
+        ? await api.signup({ email: email.trim(), password, name: name.trim(), lang })
+        : await api.login({ email: email.trim(), password });
+      saveAuth(res.token, res.user);
+      onAuthed(res.user);
     } catch (e) {
       setMsg({ t: "err", m: e.message || "Something went wrong." });
     } finally {
@@ -127,33 +93,6 @@ function Auth() {
   );
 }
 
-function Profile({ onDone }) {
-  const [name, setName] = useState("");
-  const [lang, setLang] = useState("EN");
-  const [busy, setBusy] = useState(false);
-  const save = async () => {
-    if (!name.trim()) return;
-    setBusy(true);
-    await supabase.auth.updateUser({ data: { display_name: name.trim(), lang } });
-    setBusy(false);
-    onDone();
-  };
-  return (
-    <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-      <div style={{ width: 320, maxWidth: "90vw" }}>
-        <div style={mono.brand}><span style={{ color: ACCENT }}>SET UP</span></div>
-        <label style={{ ...lbl, marginTop: 18 }}>Display name</label>
-        <input value={name} onChange={(e) => setName(e.target.value)} style={field} />
-        <label style={{ ...lbl, marginTop: 16 }}>Language</label>
-        <select value={lang} onChange={(e) => setLang(e.target.value)} style={field}>
-          {LANGS.map((l) => <option key={l.code} value={l.code} style={{ background: "#16212e" }}>{l.code} · {l.name}</option>)}
-        </select>
-        <button onClick={save} disabled={busy} style={{ ...btn, width: "100%", marginTop: 20 }}>Continue</button>
-      </div>
-    </div>
-  );
-}
-
 function Bubble({ m, me }) {
   const own = m.sender_id === me.id;
   const [showOriginal, setShowOriginal] = useState(false);
@@ -180,11 +119,12 @@ function Bubble({ m, me }) {
   );
 }
 
-function Room({ me }) {
+function Room({ me, onSignOut }) {
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [status, setStatus] = useState("connecting");
   const scrollRef = useRef(null);
+  const wsRef = useRef(null);
   const meRef = useRef(me);
   meRef.current = me;
 
@@ -200,7 +140,8 @@ function Room({ me }) {
   }, []);
 
   const ingest = useCallback((row) => {
-    const needs = row.sender_id !== meRef.current.id && row.source_lang !== meRef.current.lang;
+    const v = meRef.current;
+    const needs = row.sender_id !== v.id && row.source_lang !== v.lang;
     setMessages((ms) => {
       if (ms.some((x) => x.id === row.id)) return ms;
       return [...ms, { ...row, translated: "", status: needs ? "sending" : "done" }];
@@ -209,25 +150,28 @@ function Room({ me }) {
   }, [interpret]);
 
   useEffect(() => {
-    let channel;
-    (async () => {
-      const { data } = await supabase.from("messages").select("*").eq("room", ROOM).order("created_at", { ascending: true }).limit(100);
-      (data || []).forEach(ingest);
-      channel = supabase.channel("room:" + ROOM)
-        .on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: "room=eq." + ROOM }, ({ new: row }) => ingest(row))
-        .subscribe((s) => setStatus(s === "SUBSCRIBED" ? "live" : "connecting"));
-    })();
-    return () => { if (channel) supabase.removeChannel(channel); };
+    let alive = true;
+    // 1. load history over REST
+    api.messages().then((rows) => { if (alive) rows.forEach(ingest); }).catch(() => {});
+    // 2. open the live socket
+    const ws = api.openSocket();
+    wsRef.current = ws;
+    ws.onopen = () => setStatus("live");
+    ws.onclose = () => setStatus("connecting");
+    ws.onmessage = (ev) => {
+      let data; try { data = JSON.parse(ev.data); } catch { return; }
+      if (data.type === "message") ingest(data.message);
+    };
+    return () => { alive = false; ws.close(); };
   }, [ingest]);
 
   useEffect(() => { const el = scrollRef.current; if (el) el.scrollTop = el.scrollHeight; }, [messages]);
 
-  const send = async () => {
+  const send = () => {
     const text = draft.trim();
-    if (!text) return;
+    if (!text || !wsRef.current || wsRef.current.readyState !== 1) return;
     setDraft("");
-    const { error } = await supabase.from("messages").insert({ room: ROOM, sender_id: me.id, sender_name: me.name, source_lang: me.lang, text });
-    if (error) console.error(error);
+    wsRef.current.send(JSON.stringify({ type: "send", text }));
   };
 
   return (
@@ -239,7 +183,7 @@ function Room({ me }) {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <span style={{ ...mono.meta, color: status === "live" ? ACCENT : "#8ba0b4" }}>{status === "live" ? "● live" : "○ connecting"}</span>
-          <button onClick={() => supabase.auth.signOut()} style={linkBtn}>sign out</button>
+          <button onClick={onSignOut} style={linkBtn}>sign out</button>
         </div>
       </header>
       <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "18px 16px 8px", maxWidth: 760, width: "100%", margin: "0 auto" }}>
@@ -261,29 +205,17 @@ function Room({ me }) {
 }
 
 export default function App() {
-  const [session, setSession] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [profileDone, setProfileDone] = useState(0);
+  const [me, setMe] = useState(null);
+  const [ready, setReady] = useState(false);
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setLoading(false); });
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
-    return () => sub.subscription.unsubscribe();
-  }, []);
+  useEffect(() => { const saved = loadAuth(); if (saved) setMe(saved.user); setReady(true); }, []);
+
+  const signOut = () => { clearAuth(); setMe(null); };
 
   let content;
-  if (loading) {
-    content = <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: "#54697c", fontFamily: "ui-monospace, monospace", fontSize: 13 }}>loading...</div>;
-  } else if (!session) {
-    content = <Auth />;
-  } else {
-    const md = session.user.user_metadata || {};
-    if (!md.display_name || !md.lang) {
-      content = <Profile onDone={() => setProfileDone((n) => n + 1)} />;
-    } else {
-      content = <Room key={profileDone} me={{ id: session.user.id, name: md.display_name, lang: md.lang }} />;
-    }
-  }
+  if (!ready) content = <div style={{ height: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: "#54697c", fontFamily: "ui-monospace, monospace", fontSize: 13 }}>loading...</div>;
+  else if (!me) content = <Auth onAuthed={setMe} />;
+  else content = <Room key={me.id} me={me} onSignOut={signOut} />;
 
   return (
     <div style={{ height: "100vh", background: "#0b131b", color: "#e8eef4", fontFamily: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" }}>
